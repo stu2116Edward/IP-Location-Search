@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/csv"
 	"flag"
@@ -9,14 +10,12 @@ import (
 	"io"
 	"net"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// ==================== xdb 包代码 ====================
-
+// ==================== 常量定义 ====================
 const (
 	Structure20      = 2
 	Structure30      = 3
@@ -24,7 +23,33 @@ const (
 	VectorIndexRows  = 256
 	VectorIndexCols  = 256
 	VectorIndexSize  = 8
+
+	// 缓存策略常量
+	NoCache     = 0 // 文件模式
+	VIndexCache = 1 // 向量索引缓存模式
+	BufferCache = 2 // 全内存缓存模式
+
+	// 默认配置
+	DefaultV4DB       = "ip2region_v4.xdb"
+	DefaultV6DB       = "ip2region_v6.xdb"
+	DefaultInputFile  = "ips.txt"
+	DefaultOutputFile = "result.csv"
+	DefaultCacheMode  = "content"
+
+	// CSV 缓冲区大小
+	CSVBufferSize = 1 << 20 // 1MB
+
+	// 定期刷新
+	FlushInterval = 100
+
+	// 进度显示间隔
+	ProgressInterval = 500 * time.Millisecond
 )
+
+// ==================== 全局变量 ====================
+var debug bool
+
+// ==================== xdb 包代码 ====================
 
 type IndexPolicy int
 
@@ -57,7 +82,7 @@ type Header struct {
 
 // NewHeader 解析xdb文件头
 func NewHeader(input []byte) (*Header, error) {
-	if len(input) < 16 {
+	if len(input) < 20 {
 		return nil, fmt.Errorf("invalid input buffer")
 	}
 	return &Header{
@@ -88,8 +113,8 @@ var (
 		Bytes:            4,
 		SegmentIndexSize: 14,
 		IPCompare: func(ip1, ip2 []byte) int {
-			// ip1 - Big endian byte order parsed from input
-			// ip2 - Little endian byte order read from xdb index
+			// ip1 - 从输入解析的大端字节序
+			// ip2 - 从 xdb 索引读取的小端字节序
 			ip2[0], ip2[3] = ip2[3], ip2[0]
 			ip2[1], ip2[2] = ip2[2], ip2[1]
 			for i := 0; i < 4; i++ {
@@ -198,7 +223,7 @@ func (s *Searcher) Search(ip string) (string, error) {
 	}
 
 	// 二分查找索引区
-	bytes, dBytes := len(ipBytes), len(ipBytes)<<1
+	bytesLen, dBytes := len(ipBytes), len(ipBytes)<<1
 	segIndexSize := uint32(s.version.SegmentIndexSize)
 	buff := make([]byte, segIndexSize)
 	l, h := 0, int((ePtr-sPtr)/segIndexSize)
@@ -210,9 +235,9 @@ func (s *Searcher) Search(ip string) (string, error) {
 			return "", err
 		}
 		// 比较IP地址
-		if s.version.IPCompare(ipBytes, buff[0:bytes]) < 0 {
+		if s.version.IPCompare(ipBytes, buff[0:bytesLen]) < 0 {
 			h = m - 1
-		} else if s.version.IPCompare(ipBytes, buff[bytes:dBytes]) > 0 {
+		} else if s.version.IPCompare(ipBytes, buff[bytesLen:dBytes]) > 0 {
 			l = m + 1
 		} else {
 			// 找到匹配，读取区域数据
@@ -251,7 +276,7 @@ func (s *Searcher) read(offset int64, buff []byte) error {
 
 // parseIP 解析IP地址为字节数组
 func parseIP(ip string) ([]byte, error) {
-	parsedIP := net.ParseIP(ip)
+	parsedIP := net.ParseIP(strings.TrimSpace(ip))
 	if parsedIP == nil {
 		return nil, fmt.Errorf("invalid ip address: %s", ip)
 	}
@@ -316,13 +341,6 @@ func loadHeader(handle io.ReadSeeker) (*Header, error) {
 
 // ==================== service 包代码 ====================
 
-// 缓存策略常量
-const (
-	NoCache     = 0 // 文件模式
-	VIndexCache = 1 // 向量索引缓存模式
-	BufferCache = 2 // 全内存缓存模式
-)
-
 // Config 配置结构
 type Config struct {
 	cachePolicy int
@@ -331,6 +349,7 @@ type Config struct {
 	header      *Header
 	cBuffer     []byte
 	searchers   int
+	RecordCount int
 }
 
 // NewV4Config 创建IPv4配置
@@ -369,6 +388,7 @@ func newConfig(cachePolicy int, ipVersion *Version, xdbPath string) (*Config, er
 			return nil, err
 		}
 	}
+	recordCount := int((header.EndIndexPtr-header.StartIndexPtr)/uint32(ipVersion.SegmentIndexSize)) + 1
 	return &Config{
 		cachePolicy: cachePolicy,
 		ipVersion:   ipVersion,
@@ -376,6 +396,7 @@ func newConfig(cachePolicy int, ipVersion *Version, xdbPath string) (*Config, er
 		header:      header,
 		cBuffer:     cBuffer,
 		searchers:   1,
+		RecordCount: recordCount,
 	}, nil
 }
 
@@ -451,16 +472,15 @@ func (ip2r *Ip2Region) Search(ip string) (string, error) {
 			return ip2r.v4Searcher.Search(ip)
 		}
 		return "", nil
-	} else {
-		// IPv6查询
-		if ip2r.v6InMemSearcher != nil {
-			return ip2r.v6InMemSearcher.Search(ip)
-		}
-		if ip2r.v6Searcher != nil {
-			return ip2r.v6Searcher.Search(ip)
-		}
-		return "", nil
 	}
+	// IPv6查询
+	if ip2r.v6InMemSearcher != nil {
+		return ip2r.v6InMemSearcher.Search(ip)
+	}
+	if ip2r.v6Searcher != nil {
+		return ip2r.v6Searcher.Search(ip)
+	}
+	return "", nil
 }
 
 // Close 关闭服务
@@ -470,44 +490,6 @@ func (ip2r *Ip2Region) Close() {
 	}
 	if ip2r.v6Searcher != nil {
 		ip2r.v6Searcher.Close()
-	}
-}
-
-// ==================== 主程序代码 ====================
-
-// 全局调试标志
-var debug bool
-
-func main() {
-	// 解析命令行参数
-	debugFlag := flag.Bool("debug", false, "输出调试信息")
-	v4DB := flag.String("v4db", "ip2region_v4.xdb", "IPv4数据库文件路径")
-	v6DB := flag.String("v6db", "ip2region_v6.xdb", "IPv6数据库文件路径")
-	inputFile := flag.String("input", "ips.txt", "IP地址输入文件路径")
-	outputFile := flag.String("output", "result.csv", "输出CSV文件路径")
-	cachePolicy := flag.String("cache", "content", "缓存策略: file/vectorIndex/content")
-	flag.Parse()
-	debug = *debugFlag
-
-	fmt.Println("🔧 IP地址归属地查询工具")
-	fmt.Println("=======================")
-
-	// 创建Ip2Region服务
-	ip2region, err := createIp2RegionService(*v4DB, *v6DB, *cachePolicy)
-	if err != nil {
-		fmt.Printf("❌ 创建查询服务失败: %v\n", err)
-		fmt.Println("\n请确保数据库文件存在：")
-		fmt.Println("  - ip2region_v4.xdb")
-		fmt.Println("  - ip2region_v6.xdb")
-		return
-	}
-	defer ip2region.Close()
-
-	fmt.Println("✅ 查询服务初始化成功\n")
-
-	// 执行查询
-	if err := processIPs(*inputFile, *outputFile, ip2region); err != nil {
-		fmt.Printf("❌ 处理失败: %v\n", err)
 	}
 }
 
@@ -531,11 +513,13 @@ func createIp2RegionService(v4Path, v6Path, cachePolicy string) (*Ip2Region, err
 		if err := VerifyFromFile(v4Path); err != nil {
 			return nil, fmt.Errorf("IPv4数据库验证失败: %w", err)
 		}
-		v4Config, err = NewV4Config(policy, v4Path)
-		if err != nil {
-			return nil, fmt.Errorf("创建IPv4配置失败: %w", err)
+		var configErr error
+		v4Config, configErr = NewV4Config(policy, v4Path)
+		if configErr != nil {
+			return nil, fmt.Errorf("创建IPv4配置失败: %w", configErr)
 		}
-		fmt.Printf("📘 IPv4数据库: %s (策略: %s)\n", v4Path, cachePolicy)
+		fmt.Printf("📘 加载IPv4数据库: %s\n", v4Path)
+		fmt.Printf("   ✅ IPv4数据库加载成功，共 %d 条记录\n", v4Config.RecordCount)
 	} else {
 		fmt.Printf("⚠️  IPv4数据库不存在: %s\n", v4Path)
 	}
@@ -547,11 +531,13 @@ func createIp2RegionService(v4Path, v6Path, cachePolicy string) (*Ip2Region, err
 		if err := VerifyFromFile(v6Path); err != nil {
 			return nil, fmt.Errorf("IPv6数据库验证失败: %w", err)
 		}
-		v6Config, err = NewV6Config(policy, v6Path)
-		if err != nil {
-			return nil, fmt.Errorf("创建IPv6配置失败: %w", err)
+		var configErr error
+		v6Config, configErr = NewV6Config(policy, v6Path)
+		if configErr != nil {
+			return nil, fmt.Errorf("创建IPv6配置失败: %w", configErr)
 		}
-		fmt.Printf("📗 IPv6数据库: %s (策略: %s)\n", v6Path, cachePolicy)
+		fmt.Printf("📗 加载IPv6数据库: %s\n", v6Path)
+		fmt.Printf("   ✅ IPv6数据库加载成功，共 %d 条记录\n", v6Config.RecordCount)
 	} else {
 		fmt.Printf("⚠️  IPv6数据库不存在: %s\n", v6Path)
 	}
@@ -560,207 +546,492 @@ func createIp2RegionService(v4Path, v6Path, cachePolicy string) (*Ip2Region, err
 	return NewIp2Region(v4Config, v6Config)
 }
 
-// processIPs 处理IP列表
-func processIPs(inputFile, outputFile string, ip2region *Ip2Region) error {
-	// 读取IP列表
-	fmt.Println("📖 读取IP地址文件...")
+// ==================== 工具函数 ====================
 
-	ips, err := readIPsFromFile(inputFile)
-	if err != nil {
-		return fmt.Errorf("读取IP文件失败: %w", err)
-	}
-	if len(ips) == 0 {
-		return fmt.Errorf("没有找到任何IP地址")
-	}
+// isDigitByte 判断字节是否为数字字符
+func isDigitByte(b byte) bool {
+	return b >= '0' && b <= '9'
+}
 
-	// 统计IPv4和IPv6数量
-	ipv4Count, ipv6Count := 0, 0
-	for _, ip := range ips {
-		if strings.Contains(ip, ".") {
-			ipv4Count++
-		} else {
-			ipv6Count++
+// isHexByte 判断字节是否为十六进制字符
+func isHexByte(b byte) bool {
+	return (b >= '0' && b <= '9') ||
+		(b >= 'a' && b <= 'f') ||
+		(b >= 'A' && b <= 'F')
+}
+
+// validIPv4Bytes 校验一个字节切片是否为合法的 IPv4（不进行 net.ParseIP 分配）
+// 要求格式为 N.N.N.N，每段 0-255，且无多余字符
+func validIPv4Bytes(b []byte) bool {
+	if len(b) < 7 || len(b) > 15 {
+		return false
+	}
+	parts := 0
+	n := len(b)
+	i := 0
+	for i < n {
+		// parse number
+		if !isDigitByte(b[i]) {
+			return false
+		}
+		val := 0
+		start := i
+		for i < n && isDigitByte(b[i]) {
+			val = val*10 + int(b[i]-'0')
+			// early reject large numbers
+			if val > 255 {
+				return false
+			}
+			i++
+		}
+		if i == start {
+			return false
+		}
+		parts++
+		// if end, ok
+		if i == n {
+			break
+		}
+		// expect '.'
+		if b[i] != '.' {
+			return false
+		}
+		i++
+		// more parts expected
+		if i >= n {
+			return false
 		}
 	}
-	fmt.Printf("✅ 找到 %d 个IP地址 (IPv4: %d, IPv6: %d)\n\n", len(ips), ipv4Count, ipv6Count)
+	return parts == 4
+}
 
-	// 创建输出文件
+// isHeaderLine 判断文本行是否为表头
+func isHeaderLine(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "ip") || strings.Contains(lower, "address") ||
+		strings.Contains(lower, "ipaddress") || strings.Contains(lower, "ip地址")
+}
+
+// extractIPsFromBytes 从字节切片中提取所有IP（IPv4和IPv6混合）
+func extractIPsFromBytes(line []byte) []string {
+	var results []string
+	l := len(line)
+	i := 0
+	ipSet := make(map[string]bool) // 本行去重
+
+	for i < l {
+		c := line[i]
+
+		// 尝试 IPv4：数字并且下一个在合理长度内包含 '.'
+		if isDigitByte(c) && (i == 0 || !isDigitByte(line[i-1])) {
+			// 快速检查：向前查看点和数字，最多15个字符
+			j := i
+			dotCount := 0
+			for j < l && j-i <= 15 {
+				if isDigitByte(line[j]) {
+					j++
+					continue
+				}
+				if line[j] == '.' {
+					dotCount++
+					j++
+					continue
+				}
+				break
+			}
+			if dotCount == 3 {
+				cand := line[i:j]
+				// 验证 IPv4 无分配：解析各段
+				if validIPv4Bytes(cand) {
+					ipStr := string(cand)
+					// 最终的 net.ParseIP 检查以拒绝奇怪的情况（例如，256）
+					if net.ParseIP(ipStr) != nil {
+						if !ipSet[ipStr] {
+							ipSet[ipStr] = true
+							results = append(results, ipStr)
+							if debug {
+								fmt.Printf("DEBUG: 提取到IP: %s\n", ipStr)
+							}
+						}
+						i = j
+						continue
+					}
+				}
+			}
+		}
+
+		// 尝试 IPv6：十六进制或 ':' 并且在合理长度内（最多 45 个字符）包含 ':'
+		if (isHexByte(c) || c == ':') && (i == 0 || !(isHexByte(line[i-1]) || line[i-1] == ':')) {
+			j := i
+			hasColon := false
+			for j < l && j-i <= 45 {
+				b := line[j]
+				if isHexByte(b) || b == ':' || b == '.' {
+					if b == ':' {
+						hasColon = true
+					}
+					j++
+				} else {
+					break
+				}
+			}
+			if hasColon {
+				cand := line[i:j]
+				// 使用 net.ParseIP 进行强健的 IPv6 验证
+				if ip := net.ParseIP(string(cand)); ip != nil && ip.To16() != nil && ip.To4() == nil {
+					ipStr := string(cand)
+					if !ipSet[ipStr] {
+						ipSet[ipStr] = true
+						results = append(results, ipStr)
+						if debug {
+							fmt.Printf("DEBUG: 提取到IP: %s\n", ipStr)
+						}
+					}
+					i = j
+					continue
+				}
+			}
+		}
+
+		i++
+	}
+	return results
+}
+
+// ==================== 处理流程 ====================
+
+// QueryResult 查询结果
+type QueryResult struct {
+	IP      string
+	Region  string
+	Success bool
+	Error   error
+	Unknown bool
+	IsIPv4  bool
+}
+
+// processQueryResult 处理查询结果并写入CSV
+func processQueryResult(result *QueryResult) []string {
+	row := make([]string, 0, 4)
+
+	if !result.Success {
+		if debug {
+			row = append(row, result.IP, "", "失败", result.Error.Error())
+		} else {
+			row = append(row, result.IP, "")
+		}
+		return row
+	}
+
+	if result.Unknown {
+		if debug {
+			row = append(row, result.IP, "", "失败", "未找到归属地")
+		} else {
+			row = append(row, result.IP, "")
+		}
+		return row
+	}
+
+	// 成功的情况
+	if debug {
+		row = append(row, result.IP, result.Region, "成功", "")
+	} else {
+		row = append(row, result.IP, result.Region)
+	}
+	return row
+}
+
+// processIPsStreaming 流式处理IP文件
+func processIPsStreaming(inputFile, outputFile string, ip2region *Ip2Region) error {
+	input, err := os.Open(inputFile)
+	if err != nil {
+		return fmt.Errorf("打开输入文件失败: %w", err)
+	}
+	defer input.Close()
+
 	output, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("创建输出文件失败: %w", err)
 	}
 	defer output.Close()
 
-	// 创建CSV写入器
-	csvWriter := csv.NewWriter(output)
-	defer csvWriter.Flush()
+	// 写入 UTF-8 BOM 头
+	if _, err := output.Write([]byte("\uFEFF")); err != nil {
+		return fmt.Errorf("写入UTF-8 BOM失败: %w", err)
+	}
 
-	// 写入CSV头部
+	bufOut := bufio.NewWriterSize(output, CSVBufferSize)
+	csvWriter := csv.NewWriter(bufOut)
+	defer func() {
+		csvWriter.Flush()
+		bufOut.Flush()
+	}()
+
+	// 写入 CSV 头部
 	headers := []string{"IP地址", "归属地"}
 	if debug {
-		headers = []string{"IP地址", "归属地", "状态", "错误信息"}
+		headers = append(headers, "状态", "错误信息")
 	}
-	csvWriter.Write(headers)
+	if err := csvWriter.Write(headers); err != nil {
+		return fmt.Errorf("写入CSV头部失败: %w", err)
+	}
 
-	fmt.Println("🔍 开始查询...\n")
+	reader := bufio.NewReader(input)
 
-	var successCount, failCount int
+	var totalRows, totalCount, successCount, failCount, ipv4Count, ipv6Count int64
 	startTime := time.Now()
 
-	// 按顺序查询每个IP
-	for i, ip := range ips {
-		// 显示IP类型图标
-		icon := "🌐"
-		if strings.Contains(ip, ".") {
-			icon = "📘"
-		} else {
-			icon = "📗"
-		}
-		fmt.Printf("%s [%d/%d] %s ", icon, i+1, len(ips), ip)
+	// 启动进度报告 goroutine
+	stopProgress := make(chan bool)
+	progressDone := make(chan bool)
 
-		// 执行查询
-		region, err := ip2region.Search(ip)
-
-		var row []string
-		if err != nil {
-			failCount++
-			fmt.Printf("❌ 错误: %v\n", err)
-			if debug {
-				row = []string{ip, "", "失败", err.Error()}
-			} else {
-				row = []string{ip, ""}
-			}
-		} else if region == "" {
-			failCount++
-			fmt.Printf("❌ 未找到归属地\n")
-			if debug {
-				row = []string{ip, "", "失败", "未找到归属地"}
-			} else {
-				row = []string{ip, ""}
-			}
-		} else {
-			successCount++
-			// 格式化显示结果
-			parts := strings.Split(region, "|")
-			if len(parts) >= 5 {
-				country, province, city, isp := parts[0], parts[2], parts[3], parts[4]
-				if country == "0" {
-					country = ""
-				}
-				if province == "0" {
-					province = ""
-				}
-				if city == "0" {
-					city = ""
-				}
-				if isp == "0" {
-					isp = ""
-				}
-				fmt.Printf("✅ %s%s%s %s\n", country, province, city, isp)
-			} else {
-				fmt.Printf("✅ %s\n", region)
-			}
-			if debug {
-				row = []string{ip, region, "成功", ""}
-			} else {
-				row = []string{ip, region}
-			}
-		}
-		csvWriter.Write(row)
-
-		// 每100条刷新一次
-		if (i+1)%100 == 0 {
-			csvWriter.Flush()
-			elapsed := time.Since(startTime)
-			fmt.Printf("\n📊 进度: %d/%d (%.1f%%), 耗时: %v\n",
-				i+1, len(ips), float64(i+1)/float64(len(ips))*100, elapsed)
-		}
+	if !debug {
+		fmt.Println("🔍 开始查询")
+	} else {
+		fmt.Println("🔍 开始查询")
 	}
 
-	// 打印统计信息
-	elapsed := time.Since(startTime)
-	fmt.Println("\n" + strings.Repeat("=", 50))
-	fmt.Println("📊 查询统计:")
-	fmt.Printf("  总查询数: %d\n", len(ips))
-	fmt.Printf("  ✅ 成功: %d\n", successCount)
-	fmt.Printf("  ❌ 失败: %d\n", failCount)
-	if len(ips) > 0 {
-		fmt.Printf("  📈 成功率: %.2f%%\n", float64(successCount)/float64(len(ips))*100)
-	}
-	fmt.Printf("  ⏱️  总耗时: %v\n", elapsed)
-	fmt.Printf("  ⚡ 平均速度: %.2f 个/秒\n", float64(len(ips))/elapsed.Seconds())
-	fmt.Printf("  📄 结果保存到: %s\n", outputFile)
-	fmt.Println(strings.Repeat("=", 50))
+	go func() {
+		ticker := time.NewTicker(ProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				printProgress(atomic.LoadInt64(&totalRows), atomic.LoadInt64(&totalCount),
+					atomic.LoadInt64(&successCount), atomic.LoadInt64(&failCount),
+					atomic.LoadInt64(&ipv4Count), atomic.LoadInt64(&ipv6Count), startTime)
+			case <-stopProgress:
+				printProgress(atomic.LoadInt64(&totalRows), atomic.LoadInt64(&totalCount),
+					atomic.LoadInt64(&successCount), atomic.LoadInt64(&failCount),
+					atomic.LoadInt64(&ipv4Count), atomic.LoadInt64(&ipv6Count), startTime)
+				progressDone <- true
+				return
+			}
+		}
+	}()
 
-	return nil
-}
+	firstRecord := true
+	for {
+		lineBytes, err := reader.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			close(stopProgress)
+			<-progressDone
+			return fmt.Errorf("读取文本行失败: %w", err)
+		}
 
-// readIPsFromFile 从文件中读取所有IP地址（IPv4和IPv6混合）
-func readIPsFromFile(filename string) ([]string, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
+		// 去除行尾换行符（兼容 CRLF）
+		lineBytes = bytes.TrimRight(lineBytes, "\r\n")
+		lineLen := len(lineBytes)
 
-	// IPv4和IPv6正则表达式
-	ipv4Regex := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
-	ipv6Regex := regexp.MustCompile(`\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,7}:\b`)
+		// 将行计数提前
+		atomic.AddInt64(&totalRows, 1)
 
-	scanner := bufio.NewScanner(file)
-	// 设置更大的缓冲区
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+		// 如果是 EOF 且当前行为空，则退出循环
+		if err == io.EOF && lineLen == 0 {
+			break
+		}
 
-	var allIPs []string
-	ipSet := make(map[string]bool) // 用于去重，保持第一次出现的顺序
+		// 跳过 UTF-8 BOM
+		if atomic.LoadInt64(&totalRows) == 1 && lineLen >= 3 {
+			if lineBytes[0] == 0xEF && lineBytes[1] == 0xBB && lineBytes[2] == 0xBF {
+				lineBytes = lineBytes[3:]
+				lineLen = len(lineBytes)
+			}
+		}
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		// 去除首尾空白
+		trimmed := bytes.TrimSpace(lineBytes)
+		trimmedLen := len(trimmed)
 
-		// 跳过空行和注释
-		if line == "" || strings.HasPrefix(line, "#") {
+		// 处理首行表头
+		if firstRecord {
+			if trimmedLen == 0 {
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+			firstRecord = false
+			if isHeaderLine(string(trimmed)) {
+				if debug {
+					fmt.Println("DEBUG: 跳过CSV/文本头部")
+				}
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+		}
+
+		// 跳过空行
+		if trimmedLen == 0 {
+			if err == io.EOF {
+				break
+			}
 			continue
 		}
 
-		// 按行处理，保持行的顺序
-		// 先尝试提取IPv4地址
-		ipv4Matches := ipv4Regex.FindAllString(line, -1)
-		for _, ip := range ipv4Matches {
-			if isValidIPv4(ip) && !ipSet[ip] {
-				ipSet[ip] = true
-				allIPs = append(allIPs, ip)
+		// 提取本行的所有 IP
+		ips := extractIPsFromBytes(trimmed)
+		if len(ips) == 0 {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
+		// 处理提取到的 IP
+		for _, ip := range ips {
+			atomic.AddInt64(&totalCount, 1)
+
+			// 判断IP版本
+			isIPv4 := strings.Contains(ip, ".")
+			if isIPv4 {
+				atomic.AddInt64(&ipv4Count, 1)
+			} else {
+				atomic.AddInt64(&ipv6Count, 1)
+			}
+
+			// 执行查询
+			region, queryErr := ip2region.Search(ip)
+
+			result := &QueryResult{IP: ip, Region: region, IsIPv4: isIPv4}
+
+			if queryErr != nil {
+				atomic.AddInt64(&failCount, 1)
+				result.Success = false
+				result.Error = queryErr
+				if debug {
+					fmt.Printf("❌ %s 错误: %v\n", ip, queryErr)
+				}
+			} else if region == "" {
+				atomic.AddInt64(&failCount, 1)
+				result.Success = true
+				result.Unknown = true
+				if debug {
+					fmt.Printf("❌ %s 未找到归属地\n", ip)
+				}
+			} else {
+				atomic.AddInt64(&successCount, 1)
+				result.Success = true
+				if debug {
+					parts := strings.Split(region, "|")
+					if len(parts) >= 5 {
+						country, province, city, isp := parts[0], parts[2], parts[3], parts[4]
+						// 处理"0"值
+						if country == "0" {
+							country = ""
+						}
+						if province == "0" {
+							province = ""
+						}
+						if city == "0" {
+							city = ""
+						}
+						if isp == "0" {
+							isp = ""
+						}
+						fmt.Printf("✅ %s %s%s%s %s\n", ip, country, province, city, isp)
+					} else {
+						fmt.Printf("✅ %s %s\n", ip, region)
+					}
+				}
+			}
+
+			row := processQueryResult(result)
+			csvWriter.Write(row)
+
+			// 定期刷新缓冲区
+			if atomic.LoadInt64(&totalCount)%FlushInterval == 0 {
+				csvWriter.Flush()
+				bufOut.Flush()
 			}
 		}
 
-		// 提取IPv6地址
-		ipv6Matches := ipv6Regex.FindAllString(line, -1)
-		for _, ip := range ipv6Matches {
-			if !ipSet[ip] {
-				ipSet[ip] = true
-				allIPs = append(allIPs, ip)
-			}
+		if err == io.EOF {
+			break
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
+	close(stopProgress)
+	<-progressDone
 
-	return allIPs, nil
+	csvWriter.Flush()
+	bufOut.Flush()
+
+	printFinalStats(atomic.LoadInt64(&totalRows), atomic.LoadInt64(&totalCount),
+		atomic.LoadInt64(&successCount), atomic.LoadInt64(&failCount),
+		atomic.LoadInt64(&ipv4Count), atomic.LoadInt64(&ipv6Count), time.Since(startTime), outputFile)
+	return nil
 }
 
-// isValidIPv4 验证IPv4地址
-func isValidIPv4(ip string) bool {
-	parts := strings.Split(ip, ".")
-	if len(parts) != 4 {
-		return false
+// printProgress 打印进度信息
+func printProgress(totalRows, totalCount, successCount, failCount, ipv4Count, ipv6Count int64, startTime time.Time) {
+	elapsed := time.Since(startTime)
+	if totalCount > 0 {
+		rate := float64(totalCount) / elapsed.Seconds()
+		fmt.Printf("\r📊 进度: 已处理 %d 行, 查询 %d 个IP (%.0f 条/秒): %d 失败: %d IPv4: %d IPv6: %d 耗时: %v",
+			totalRows, totalCount, rate, successCount, failCount, ipv4Count, ipv6Count, elapsed.Round(time.Second))
+	} else if totalRows > 0 {
+		fmt.Printf("\r📊 进度: 已处理 %d 行, 等待发现IP... 耗时: %v",
+			totalRows, elapsed.Round(time.Second))
 	}
-	for _, part := range parts {
-		num, err := strconv.Atoi(part)
-		if err != nil || num < 0 || num > 255 {
-			return false
-		}
+}
+
+// printFinalStats 打印最终统计信息
+func printFinalStats(totalRows, totalCount, successCount, failCount, ipv4Count, ipv6Count int64, elapsed time.Duration, outputFile string) {
+	fmt.Print("\n")
+	fmt.Printf("✅ 处理完成！\n")
+	fmt.Printf("   总行数: %d 行\n", totalRows)
+	fmt.Printf("   总查询数: %d 个IP\n", totalCount)
+	fmt.Printf("   ✅ 成功: %d\n", successCount)
+	fmt.Printf("   ❌ 失败: %d\n", failCount)
+	fmt.Printf("   📘 IPv4: %d 个\n", ipv4Count)
+	fmt.Printf("   📗 IPv6: %d 个\n", ipv6Count)
+
+	if totalCount > 0 {
+		rate := float64(totalCount) / elapsed.Seconds()
+		fmt.Printf("   ⏱️ 总耗时: %v\n", elapsed.Round(time.Second))
+		fmt.Printf("   ⚡ 平均速度: %.0f 个IP/秒\n", rate)
+	} else {
+		fmt.Printf("   未发现任何有效IP\n")
+		fmt.Printf("   总耗时: %v\n", elapsed.Round(time.Second))
 	}
-	return true
+
+	fmt.Printf("   📄 结果已保存到: %s\n", outputFile)
+}
+
+// ==================== 主程序代码 ====================
+
+func main() {
+	// 解析命令行参数
+	debugFlag := flag.Bool("debug", false, "输出调试信息（状态和错误信息）")
+	v4DB := flag.String("v4db", DefaultV4DB, "IPv4数据库文件路径")
+	v6DB := flag.String("v6db", DefaultV6DB, "IPv6数据库文件路径")
+	inputFile := flag.String("input", DefaultInputFile, "IP地址输入文件路径")
+	outputFile := flag.String("output", DefaultOutputFile, "输出CSV文件路径")
+	cachePolicy := flag.String("cache", DefaultCacheMode, "缓存策略: file/vectorIndex/content")
+	flag.Parse()
+	debug = *debugFlag
+
+	fmt.Println("🔧 IP地址归属地查询工具")
+	fmt.Println("=======================")
+
+	// 创建Ip2Region服务
+	ip2region, err := createIp2RegionService(*v4DB, *v6DB, *cachePolicy)
+	if err != nil {
+		fmt.Printf("❌ 创建查询服务失败: %v\n", err)
+		fmt.Println("\n请确保数据库文件存在：")
+		fmt.Println("  - " + DefaultV4DB)
+		fmt.Println("  - " + DefaultV6DB)
+		return
+	}
+	defer ip2region.Close()
+
+	fmt.Println("✅ 数据库初始化成功")
+
+	// 流式处理
+	if err := processIPsStreaming(*inputFile, *outputFile, ip2region); err != nil {
+		fmt.Printf("❌ 处理失败: %v\n", err)
+	}
 }
