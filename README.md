@@ -36,3 +36,8 @@ go run beta.go
 ```
 go run beta.go --debug
 ```
+
+### 运行结果
+<img width="1333" height="522" alt="ILS1" src="https://github.com/user-attachments/assets/af53a173-d4ec-4ece-a521-f992fd724b64" />  
+
+<img width="1378" height="528" alt="ILS2" src="https://github.com/user-attachments/assets/3401cf7b-03a6-4dfe-8747-439f5d0ad39b" />  
