@@ -20,6 +20,19 @@ go mod init ipsearch
 ```
 
 ### 运行程序
+- 精确匹配
 ```
 go run main.go
+```
+输出详细匹配过程
+```
+go run main.go --debug
+```
+- 模糊匹配
+```
+go run beta.go
+```
+输出详细匹配过程
+```
+go run beta.go --debug
 ```
