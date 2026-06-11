@@ -20,7 +20,7 @@ go mod init ipsearch
 ```
 
 ### 运行程序
-- 精确匹配
+- 二进制查询
 ```
 go run main.go
 ```
@@ -28,7 +28,7 @@ go run main.go
 ```
 go run main.go --debug
 ```
-- 模糊匹配
+- 文本查询
 ```
 go run beta.go
 ```
