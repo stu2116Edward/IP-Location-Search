@@ -970,7 +970,7 @@ func printProgress(totalRows, totalCount, successCount, failCount, ipv4Count, ip
 	elapsed := time.Since(startTime)
 	if totalCount > 0 {
 		rate := float64(totalCount) / elapsed.Seconds()
-		fmt.Printf("\r📊 进度: 已处理 %d 行, 查询 %d 个IP (%.0f 条/秒): %d 失败: %d IPv4: %d IPv6: %d 耗时: %v",
+		fmt.Printf("\r📊 进度: 已处理 %d 行, 查询 %d 个IP (%.0f 条/秒) | ✅ 成功: %d ❌ 失败: %d | IPv4: %d IPv6: %d | 耗时: %v",
 			totalRows, totalCount, rate, successCount, failCount, ipv4Count, ipv6Count, elapsed.Round(time.Second))
 	} else if totalRows > 0 {
 		fmt.Printf("\r📊 进度: 已处理 %d 行, 等待发现IP... 耗时: %v",
@@ -1015,7 +1015,6 @@ func main() {
 	debug = *debugFlag
 
 	fmt.Println("🔧 IP地址归属地查询工具")
-	fmt.Println("=======================")
 
 	// 创建Ip2Region服务
 	ip2region, err := createIp2RegionService(*v4DB, *v6DB, *cachePolicy)
